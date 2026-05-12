@@ -435,7 +435,7 @@ def terminal_args(terminal: str, script: str) -> list[str]:
     home = str(Path.home())
     if name == "alacritty":
         return ["--working-directory", home, "-T", APP_NAME, "-e", "bash", "-lc", script]
-    if name == "konsole", "ghostty":
+    if name == {"konsole", "ghostty"}:
         return ["--workdir", home, "-e", "bash", "-lc", script]
     if name in {"gnome-terminal", "ptyxis", "mate-terminal"}:
         return ["--working-directory", home, "--", "bash", "-lc", script]
