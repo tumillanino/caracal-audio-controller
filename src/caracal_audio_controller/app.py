@@ -92,6 +92,12 @@ ACTIONS = {
         command=("ujust", "toggle-bt-mic"),
         description="Enable or disable the Bluetooth headset profile mitigation.",
     ),
+    "upgrade": AudioAction(
+        key="upgrade",
+        title="Update Caracal OS",
+        command=("ujust", "upgrade"),
+        description="Update to latest version of Caracal OS (reboot required)",
+    ),
 }
 
 
@@ -136,7 +142,7 @@ class StatusWindow(QMainWindow):
         layout.addWidget(header)
 
         quick_row = QHBoxLayout()
-        for key in ("update-audio", "route-plugins", "restart-pipewire"):
+        for key in ("update-audio", "route-plugins", "restart-pipewire", "upgrade"):
             action = ACTIONS[key]
             button = QPushButton(action.title)
             button.clicked.connect(lambda checked=False, action_key=key: controller.run_action(action_key))
@@ -229,6 +235,10 @@ class AudioController(QObject):
         scan_item = QAction("Check Yabridge Sync State", menu)
         scan_item.triggered.connect(self.scan_yabridge_state)
         menu.addAction(scan_item)
+
+        upgrade_item = QAction("Upgrade Caracal OS", menu)
+        scan_item.triggered.connect(lambda: self.run_action("upgrade"))
+        menu.addAction(upgrade_item)
 
         menu.addSeparator()
         quit_item = QAction("Quit", menu)
@@ -401,6 +411,7 @@ def find_terminal() -> str | None:
     preferred.extend(
         [
             "alacritty",
+            "ghostty",
             "konsole",
             "gnome-terminal",
             "ptyxis",
@@ -424,7 +435,7 @@ def terminal_args(terminal: str, script: str) -> list[str]:
     home = str(Path.home())
     if name == "alacritty":
         return ["--working-directory", home, "-T", APP_NAME, "-e", "bash", "-lc", script]
-    if name == "konsole":
+    if name == "konsole", "ghostty":
         return ["--workdir", home, "-e", "bash", "-lc", script]
     if name in {"gnome-terminal", "ptyxis", "mate-terminal"}:
         return ["--working-directory", home, "--", "bash", "-lc", script]
