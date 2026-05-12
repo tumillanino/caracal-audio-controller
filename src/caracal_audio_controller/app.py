@@ -6,11 +6,12 @@ import shlex
 import shutil
 import subprocess
 import sys
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import QObject, QProcess, Qt, Signal
+    from PySide6.QtCore import QObject, QProcess, QTimer, Qt, Signal
     from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
@@ -40,6 +41,8 @@ MUTED = "#9cabca"
 INFO = "#7fb4ca"
 SUCCESS = "#a6da95"
 DANGER = "#e46876"
+YABRIDGE_SCAN_INTERVAL_MS = 60000
+YABRIDGE_INITIAL_SCAN_MS = 3500
 
 
 @dataclass(frozen=True)
@@ -168,12 +171,19 @@ class AudioController(QObject):
         self.bus.log.connect(self._append_log)
         self.bus.direct_finished.connect(self._direct_finished)
         self.processes: list[QProcess] = []
-        self.icon = load_icon()
+        self.normal_icon = load_icon("normal")
+        self.notification_icon = load_icon("notification")
+        self.icon = self.normal_icon
+        self.yabridge_pending = False
+        self.yabridge_notified = False
         self.window = StatusWindow(self)
         self.tray = QSystemTrayIcon(self.icon)
         self.tray.setToolTip("Caracal Audio Controller")
         self.tray.setContextMenu(self._build_menu())
         self.tray.activated.connect(self._tray_activated)
+        self.yabridge_timer = QTimer(self)
+        self.yabridge_timer.setInterval(YABRIDGE_SCAN_INTERVAL_MS)
+        self.yabridge_timer.timeout.connect(self.scan_yabridge_state)
 
     def start(self) -> int:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -181,6 +191,8 @@ class AudioController(QObject):
             return 1
         self.tray.show()
         self.tray.showMessage(APP_NAME, "Ready. Left-click to sync Windows VSTs.", QSystemTrayIcon.Information, 3500)
+        QTimer.singleShot(YABRIDGE_INITIAL_SCAN_MS, self.scan_yabridge_state)
+        self.yabridge_timer.start()
         return self.app.exec()
 
     def _build_menu(self) -> QMenu:
@@ -213,6 +225,10 @@ class AudioController(QObject):
         status_item = QAction("Show Status", menu)
         status_item.triggered.connect(self.show_status)
         menu.addAction(status_item)
+
+        scan_item = QAction("Check Yabridge Sync State", menu)
+        scan_item.triggered.connect(self.scan_yabridge_state)
+        menu.addAction(scan_item)
 
         menu.addSeparator()
         quit_item = QAction("Quit", menu)
@@ -277,11 +293,19 @@ class AudioController(QObject):
         )
 
         args = terminal_args(terminal, script)
-        try:
-            subprocess.Popen([terminal, *args], cwd=str(Path.home()), start_new_session=True)
-        except OSError as exc:
-            self._append_log(f"Could not launch {terminal}: {exc}")
+        process = QProcess(self)
+        process.setProgram(terminal)
+        process.setArguments(args)
+        process.setWorkingDirectory(str(Path.home()))
+        process.finished.connect(
+            lambda code, status, proc=process, key=action.key: self._terminal_finished(proc, key, code)
+        )
+        self.processes.append(process)
+        process.start()
+        if not process.waitForStarted(3000):
+            self._append_log(f"Could not launch {terminal}.")
             self.tray.showMessage(APP_NAME, f"Could not launch {terminal}.", QSystemTrayIcon.Critical, 5000)
+            self.processes.remove(process)
             return
 
         self._append_log(f"Launched terminal for: {' '.join(action.command)}")
@@ -313,6 +337,19 @@ class AudioController(QObject):
             self.processes.remove(process)
         self.bus.direct_finished.emit(key, exit_code, ACTIONS[key].title)
 
+    def _terminal_finished(self, process: QProcess, key: str, exit_code: int) -> None:
+        if process in self.processes:
+            self.processes.remove(process)
+
+        if key == "update-audio" and exit_code == 0:
+            self.mark_yabridge_synced()
+            self.scan_yabridge_state(show_clear_message=True)
+            return
+
+        if exit_code != 0:
+            title = ACTIONS[key].title
+            self._append_log(f"{title} terminal exited with code {exit_code}.")
+
     def _direct_finished(self, key: str, exit_code: int, title: str) -> None:
         if exit_code == 0:
             message = f"{title} completed."
@@ -322,6 +359,38 @@ class AudioController(QObject):
             icon = QSystemTrayIcon.Critical
         self._append_log(message)
         self.tray.showMessage(APP_NAME, message, icon, 4500)
+
+    def scan_yabridge_state(self, show_clear_message: bool = False) -> None:
+        fingerprint, item_count = yabridge_fingerprint()
+        saved = read_yabridge_fingerprint()
+        pending = item_count > 0 and fingerprint != saved
+        self.set_yabridge_pending(pending, item_count, show_clear_message)
+
+    def set_yabridge_pending(self, pending: bool, item_count: int, show_clear_message: bool = False) -> None:
+        previous = self.yabridge_pending
+        self.yabridge_pending = pending
+        if pending:
+            self.tray.setIcon(self.notification_icon)
+            self.tray.setToolTip("Caracal Audio Controller - Windows VSTs need yabridge sync")
+            message = f"{item_count} Windows VST item(s) detected. Run Sync Windows VSTs."
+            if not previous:
+                self._append_log(message)
+            if not self.yabridge_notified:
+                self.tray.showMessage(APP_NAME, message, QSystemTrayIcon.Warning, 7000)
+                self.yabridge_notified = True
+        else:
+            self.tray.setIcon(self.normal_icon)
+            self.tray.setToolTip("Caracal Audio Controller")
+            self.yabridge_notified = False
+            if previous or show_clear_message:
+                self._append_log("Yabridge sync state is current.")
+
+    def mark_yabridge_synced(self) -> None:
+        fingerprint, _item_count = yabridge_fingerprint()
+        state_file = yabridge_state_file()
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(fingerprint + "\n", encoding="utf-8")
+        self._append_log("Saved yabridge sync snapshot.")
 
     def _append_log(self, message: str) -> None:
         self.window.append_log(message)
@@ -372,14 +441,16 @@ def terminal_args(terminal: str, script: str) -> list[str]:
     return ["-e", "bash", "-lc", script]
 
 
-def load_icon() -> QIcon:
-    for path in bundled_icon_paths():
+def load_icon(kind: str = "normal") -> QIcon:
+    for path in bundled_icon_paths(kind):
         icon = QIcon(str(path))
         if not icon.isNull():
             return icon
 
     for path in (
-        "/usr/share/caracal-audio-controller/assets/icon-white.sv",
+        f"/usr/share/caracal-audio-controller/assets/{icon_filename(kind, 'white')}",
+        f"/usr/share/caracal-audio-controller/assets/{icon_filename(kind, 'black')}",
+        "/usr/share/caracal-audio-controller/assets/icon-white.svg",
         "/usr/share/pixmaps/caracal-audio-controller.svg",
         "/usr/share/pixmaps/caracal-software-installer.svg",
         "/usr/share/caracal-software-installer/assets/images/caracal.svg",
@@ -406,12 +477,70 @@ def load_icon() -> QIcon:
     return QIcon(pixmap)
 
 
-def bundled_icon_paths() -> list[Path]:
+def bundled_icon_paths(kind: str) -> list[Path]:
     here = Path(__file__).resolve()
     return [
+        here.parents[2] / "assets" / icon_filename(kind, "white"),
+        here.parents[2] / "assets" / icon_filename(kind, "black"),
         here.parents[2] / "assets" / "icon-white.svg",
         here.parents[2] / "assets" / "icon-black.svg",
     ]
+
+
+def icon_filename(kind: str, color: str) -> str:
+    if kind == "notification":
+        return f"icon-{color}-notification.svg"
+    return f"icon-{color}.svg"
+
+
+def yabridge_vst3_dir() -> Path:
+    return Path.home() / ".wine" / "drive_c" / "Program Files" / "Common Files" / "VST3"
+
+
+def yabridge_state_file() -> Path:
+    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return state_home / "caracal-audio-controller" / "yabridge-vst3.fingerprint"
+
+
+def read_yabridge_fingerprint() -> str:
+    try:
+        return yabridge_state_file().read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return ""
+
+
+def yabridge_fingerprint() -> tuple[str, int]:
+    root = yabridge_vst3_dir()
+    if not root.exists():
+        return "", 0
+
+    hasher = hashlib.sha256()
+    item_count = 0
+    for path in sorted(root.rglob("*"), key=lambda item: str(item.relative_to(root)).casefold()):
+        if should_ignore_yabridge_path(path):
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+
+        relative = str(path.relative_to(root))
+        if path.is_dir():
+            if path.suffix.lower() == ".vst3":
+                item_count += 1
+            hasher.update(f"D:{relative}:{stat.st_mtime_ns}".encode())
+        elif path.is_file():
+            item_count += 1
+            hasher.update(f"F:{relative}:{stat.st_size}:{stat.st_mtime_ns}".encode())
+
+    return hasher.hexdigest(), item_count
+
+
+def should_ignore_yabridge_path(path: Path) -> bool:
+    name = path.name
+    return name in {"desktop.ini", ".DS_Store"} or name.endswith(".tmp")
 
 
 def build_stylesheet() -> str:

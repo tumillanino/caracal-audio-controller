@@ -38,8 +38,8 @@ install -d %{buildroot}%{_datadir}/icons/hicolor/16x16/apps
 install -d %{buildroot}%{_sysconfdir}/xdg/autostart
 
 cp -a src/caracal_audio_controller %{buildroot}%{_datadir}/%{name}/src/
-cp -a assets/*.png %{buildroot}%{_datadir}/%{name}/assets/
-install -pm0644 assets/icon-white.png %{buildroot}%{_datadir}/icons/hicolor/16x16/apps/caracal-audio-controller.png
+cp -a assets/*.svg assets/*.svg %{buildroot}%{_datadir}/%{name}/assets/
+install -pm0644 assets/icon-white.svg %{buildroot}%{_datadir}/icons/hicolor/16x16/apps/caracal-audio-controller.svg
 
 cat > %{buildroot}%{_bindir}/caracal-audio-controller <<'EOF'
 #!/usr/bin/env bash
@@ -57,6 +57,6 @@ install -Dpm0644 packaging/caracal-audio-controller-autostart.desktop %{buildroo
 %{_bindir}/caracal-audio-controller
 %{_datadir}/%{name}/assets/*
 %{_datadir}/%{name}/src/caracal_audio_controller/*
-%{_datadir}/icons/hicolor/16x16/apps/caracal-audio-controller.png
+%{_datadir}/icons/hicolor/16x16/apps/caracal-audio-controller.svg
 %{_datadir}/applications/caracal-audio-controller.desktop
 %{_sysconfdir}/xdg/autostart/caracal-audio-controller.desktop

@@ -8,11 +8,14 @@ It is intentionally separate from `caracal-software-installer`: the installer is
 
 - left-click the tray icon to run `ujust update-audio`
 - sync Windows VSTs with yabridge
+- switch to a notification tray icon when the Wine VST3 folder changes after the last recorded yabridge sync
 - route packaged system plugins into user scan directories
 - restart PipeWire
 - create or remove Caracal virtual audio channels
 - open the Bluetooth headset profile toggle
 - open Caracal Software Installer
+
+The yabridge reminder watches `~/.wine/drive_c/Program Files/Common Files/VST3` and records the last synced fingerprint in `~/.local/state/caracal-audio-controller/yabridge-vst3.fingerprint`.
 
 ## Development
 
