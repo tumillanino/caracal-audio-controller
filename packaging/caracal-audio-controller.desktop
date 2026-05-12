@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Caracal Audio Controller
+Comment=Run Caracal audio maintenance actions from the system tray
+Exec=caracal-audio-controller
+TryExec=caracal-audio-controller
+Icon=caracal-audio-controller
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=caracal;audio;yabridge;vst;pipewire;tray;
+StartupNotify=false
