@@ -1,5 +1,5 @@
 %global debug_package %{nil}
-%global upstream_version %{?version_override}%{!?version_override:0.1.0}
+%global upstream_version %{?version_override}%{!?version_override:0.2.0}
 %global github_owner %{?github_owner_override}%{!?github_owner_override:caracal-os}
 %global github_repo %{?github_repo_override}%{!?github_repo_override:caracal-audio-controller}
 %global source_tag %{?source_tag_override}%{!?source_tag_override:v%{upstream_version}}

@@ -1,0 +1,185 @@
+name: RPM Package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-rpm:
+    name: Build SRPM and RPM
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install packaging dependencies
+        run: |
+          set -euo pipefail
+          dnf -y install \
+            curl \
+            desktop-file-utils \
+            git \
+            python3 \
+            redhat-rpm-config \
+            rpm-build \
+            rsync \
+            tar
+          dnf clean all
+
+      - name: Resolve packaging metadata
+        id: meta
+        run: |
+          set -euo pipefail
+
+          latest_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          repo_owner="${GITHUB_REPOSITORY_OWNER:-${GITHUB_REPOSITORY%%/*}}"
+          repo_name="${GITHUB_REPOSITORY#*/}"
+
+          if [[ -n "${latest_tag}" ]]; then
+            echo "LATEST_TAG=${latest_tag}" >> "${GITHUB_ENV}"
+          fi
+
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            source_tag="${GITHUB_REF_NAME}"
+            release="1"
+          elif [[ -n "${latest_tag}" ]]; then
+            version="${latest_tag#v}"
+            source_tag="${latest_tag}"
+            release="0.$(date -u +%Y%m%d%H%M%S)"
+          else
+            version="0.1.0"
+            source_tag="v${version}"
+            release="0.$(date -u +%Y%m%d%H%M%S)"
+          fi
+
+          echo "PACKAGE_VERSION=${version}" >> "${GITHUB_ENV}"
+          echo "SOURCE_TAG=${source_tag}" >> "${GITHUB_ENV}"
+          echo "RPM_RELEASE=${release}" >> "${GITHUB_ENV}"
+          echo "GITHUB_REPO_OWNER=${repo_owner}" >> "${GITHUB_ENV}"
+          echo "GITHUB_REPO_NAME=${repo_name}" >> "${GITHUB_ENV}"
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "source_tag=${source_tag}" >> "${GITHUB_OUTPUT}"
+          echo "release=${release}" >> "${GITHUB_OUTPUT}"
+          echo "repo_owner=${repo_owner}" >> "${GITHUB_OUTPUT}"
+          echo "repo_name=${repo_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate sources
+        run: |
+          set -euo pipefail
+          python3 -c "import ast, pathlib; ast.parse(pathlib.Path('src/caracal_audio_controller/app.py').read_text())"
+          bash -n bin/caracal-audio-controller
+          desktop-file-validate \
+            packaging/caracal-audio-controller.desktop \
+            packaging/caracal-audio-controller-autostart.desktop
+
+      - name: Create source archive
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          REPO_NAME: ${{ steps.meta.outputs.repo_name }}
+        run: |
+          set -euo pipefail
+
+          name="caracal-audio-controller"
+          topdir="${PWD}/rpmbuild"
+          sourcedir="${topdir}/SOURCES"
+          specdir="${topdir}/SPECS"
+          tempdir="$(mktemp -d)"
+          srcroot="${tempdir}/${REPO_NAME}-${VERSION}"
+
+          install -d "${sourcedir}" "${specdir}" "${topdir}/SRPMS" "${topdir}/RPMS"
+          cp packaging/caracal-audio-controller.spec "${specdir}/"
+
+          mkdir -p "${srcroot}"
+          rsync -a \
+            --exclude '/.git/' \
+            --exclude '/.github/workflows/' \
+            --exclude '/rpmbuild/' \
+            --exclude '**/__pycache__/' \
+            ./ "${srcroot}/"
+
+          test -f "${srcroot}/src/caracal_audio_controller/app.py"
+          test -f "${srcroot}/assets/icon-white.png"
+          tar -C "${tempdir}" -czf "${sourcedir}/${name}-${VERSION}.tar.gz" "${REPO_NAME}-${VERSION}"
+
+      - name: Build source RPM
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE: ${{ steps.meta.outputs.release }}
+          SOURCE_TAG: ${{ steps.meta.outputs.source_tag }}
+          REPO_OWNER: ${{ steps.meta.outputs.repo_owner }}
+          REPO_NAME: ${{ steps.meta.outputs.repo_name }}
+        run: |
+          set -euo pipefail
+
+          rpmbuild -bs rpmbuild/SPECS/caracal-audio-controller.spec \
+            --define "_topdir ${PWD}/rpmbuild" \
+            --define "github_owner_override ${REPO_OWNER}" \
+            --define "github_repo_override ${REPO_NAME}" \
+            --define "source_tag_override ${SOURCE_TAG}" \
+            --define "version_override ${VERSION}" \
+            --define "release_override ${RELEASE}"
+
+      - name: Build binary RPM
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE: ${{ steps.meta.outputs.release }}
+          SOURCE_TAG: ${{ steps.meta.outputs.source_tag }}
+          REPO_OWNER: ${{ steps.meta.outputs.repo_owner }}
+          REPO_NAME: ${{ steps.meta.outputs.repo_name }}
+        run: |
+          set -euo pipefail
+
+          rpmbuild -ba rpmbuild/SPECS/caracal-audio-controller.spec \
+            --define "_topdir ${PWD}/rpmbuild" \
+            --define "github_owner_override ${REPO_OWNER}" \
+            --define "github_repo_override ${REPO_NAME}" \
+            --define "source_tag_override ${SOURCE_TAG}" \
+            --define "version_override ${VERSION}" \
+            --define "release_override ${RELEASE}"
+
+      - name: Upload RPM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: caracal-audio-controller-rpms
+          path: |
+            rpmbuild/SRPMS/*.src.rpm
+            rpmbuild/RPMS/**/*.rpm
+          if-no-files-found: error
+
+      - name: Attach RPM artifacts to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rpmbuild/SRPMS/*.src.rpm
+            rpmbuild/RPMS/**/*.rpm
+
+      - name: Trigger COPR custom webhook
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          COPR_CUSTOM_WEBHOOK_URL: ${{ secrets.COPR_CUSTOM_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${COPR_CUSTOM_WEBHOOK_URL}" ]]; then
+            echo "COPR_CUSTOM_WEBHOOK_URL is not set; skipping COPR trigger."
+            exit 0
+          fi
+
+          curl --fail --silent --show-error \
+            -X POST \
+            -H 'Content-Type: application/json' \
+            -d '{}' \
+            "${COPR_CUSTOM_WEBHOOK_URL}"
