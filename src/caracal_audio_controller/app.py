@@ -43,6 +43,9 @@ SUCCESS = "#a6da95"
 DANGER = "#e46876"
 YABRIDGE_SCAN_INTERVAL_MS = 60000
 YABRIDGE_INITIAL_SCAN_MS = 3500
+CARACAL_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
+CARACAL_UPDATE_INITIAL_CHECK_MS = 15000
+CARACAL_UPDATE_CHECK_TIMEOUT_MS = 5 * 60 * 1000
 
 
 @dataclass(frozen=True)
@@ -182,6 +185,11 @@ class AudioController(QObject):
         self.icon = self.normal_icon
         self.yabridge_pending = False
         self.yabridge_notified = False
+        self.caracal_update_pending = False
+        self.caracal_update_notified = False
+        self.update_check_process: QProcess | None = None
+        self.update_check_show_clear_message = False
+        self.update_check_commands: list[list[str]] = []
         self.window = StatusWindow(self)
         self.tray = QSystemTrayIcon(self.icon)
         self.tray.setToolTip("Caracal Audio Controller")
@@ -190,6 +198,9 @@ class AudioController(QObject):
         self.yabridge_timer = QTimer(self)
         self.yabridge_timer.setInterval(YABRIDGE_SCAN_INTERVAL_MS)
         self.yabridge_timer.timeout.connect(self.scan_yabridge_state)
+        self.caracal_update_timer = QTimer(self)
+        self.caracal_update_timer.setInterval(CARACAL_UPDATE_CHECK_INTERVAL_MS)
+        self.caracal_update_timer.timeout.connect(self.scan_caracal_update_state)
 
     def start(self) -> int:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -198,7 +209,9 @@ class AudioController(QObject):
         self.tray.show()
         self.tray.showMessage(APP_NAME, "Ready. Left-click to sync Windows VSTs.", QSystemTrayIcon.Information, 3500)
         QTimer.singleShot(YABRIDGE_INITIAL_SCAN_MS, self.scan_yabridge_state)
+        QTimer.singleShot(CARACAL_UPDATE_INITIAL_CHECK_MS, self.scan_caracal_update_state)
         self.yabridge_timer.start()
+        self.caracal_update_timer.start()
         return self.app.exec()
 
     def _build_menu(self) -> QMenu:
@@ -233,11 +246,15 @@ class AudioController(QObject):
         menu.addAction(status_item)
 
         scan_item = QAction("Check Yabridge Sync State", menu)
-        scan_item.triggered.connect(self.scan_yabridge_state)
+        scan_item.triggered.connect(lambda checked=False: self.scan_yabridge_state(show_clear_message=True))
         menu.addAction(scan_item)
 
+        update_check_item = QAction("Check for Caracal Updates", menu)
+        update_check_item.triggered.connect(lambda checked=False: self.scan_caracal_update_state(show_clear_message=True))
+        menu.addAction(update_check_item)
+
         upgrade_item = QAction("Upgrade Caracal OS", menu)
-        scan_item.triggered.connect(lambda: self.run_action("upgrade"))
+        upgrade_item.triggered.connect(lambda checked=False: self.run_action("upgrade"))
         menu.addAction(upgrade_item)
 
         menu.addSeparator()
@@ -356,6 +373,10 @@ class AudioController(QObject):
             self.scan_yabridge_state(show_clear_message=True)
             return
 
+        if key == "upgrade" and exit_code == 0:
+            self.set_caracal_update_pending(False, "Caracal update completed. Reboot if the updater requested it.", True)
+            return
+
         if exit_code != 0:
             title = ACTIONS[key].title
             self._append_log(f"{title} terminal exited with code {exit_code}.")
@@ -380,8 +401,6 @@ class AudioController(QObject):
         previous = self.yabridge_pending
         self.yabridge_pending = pending
         if pending:
-            self.tray.setIcon(self.notification_icon)
-            self.tray.setToolTip("Caracal Audio Controller - Windows VSTs need yabridge sync")
             message = f"{item_count} Windows VST item(s) detected. Run Sync Windows VSTs."
             if not previous:
                 self._append_log(message)
@@ -389,11 +408,104 @@ class AudioController(QObject):
                 self.tray.showMessage(APP_NAME, message, QSystemTrayIcon.Warning, 7000)
                 self.yabridge_notified = True
         else:
-            self.tray.setIcon(self.normal_icon)
-            self.tray.setToolTip("Caracal Audio Controller")
             self.yabridge_notified = False
             if previous or show_clear_message:
                 self._append_log("Yabridge sync state is current.")
+        self.update_tray_alert_state()
+
+    def scan_caracal_update_state(self, show_clear_message: bool = False) -> None:
+        if self.update_check_process is not None:
+            return
+
+        commands = caracal_update_check_commands()
+        if not commands:
+            if show_clear_message:
+                self._append_log("No supported Caracal update checker was found.")
+            return
+
+        self.update_check_commands = commands
+        self.update_check_show_clear_message = show_clear_message
+        self._start_next_update_check_command()
+
+    def _start_next_update_check_command(self) -> None:
+        if not self.update_check_commands:
+            self.update_check_process = None
+            return
+
+        command = self.update_check_commands.pop(0)
+        process = QProcess(self)
+        process.setProgram(command[0])
+        process.setArguments(command[1:])
+        process.setWorkingDirectory(str(Path.home()))
+        process.setProcessChannelMode(QProcess.MergedChannels)
+        process.finished.connect(
+            lambda code, status, proc=process, attempted=command: self._update_check_finished(proc, attempted, code)
+        )
+        self.update_check_process = process
+        process.start()
+
+        if not process.waitForStarted(3000):
+            self._append_log(f"Could not start update check: {' '.join(command)}")
+            self.update_check_process = None
+            self._start_next_update_check_command()
+            return
+
+        QTimer.singleShot(CARACAL_UPDATE_CHECK_TIMEOUT_MS, lambda proc=process: self._cancel_stale_update_check(proc))
+
+    def _cancel_stale_update_check(self, process: QProcess) -> None:
+        if self.update_check_process is not process:
+            return
+        self._append_log("Caracal update check timed out.")
+        process.kill()
+
+    def _update_check_finished(self, process: QProcess, command: list[str], exit_code: int) -> None:
+        if self.update_check_process is not process:
+            return
+
+        output = bytes(process.readAllStandardOutput()).decode(errors="replace")
+        self.update_check_process = None
+        result, summary = parse_caracal_update_check_output(exit_code, output)
+
+        if result is None:
+            if self.update_check_commands:
+                self._start_next_update_check_command()
+                return
+            if self.update_check_show_clear_message:
+                detail = summary or f"{' '.join(command)} failed."
+                self._append_log(f"Could not check for Caracal updates: {detail}")
+            return
+
+        self.set_caracal_update_pending(result, summary, self.update_check_show_clear_message)
+
+    def set_caracal_update_pending(self, pending: bool, summary: str = "", show_clear_message: bool = False) -> None:
+        previous = self.caracal_update_pending
+        self.caracal_update_pending = pending
+        if pending:
+            message = summary or "A new Caracal OS version is available. Run Update Caracal OS."
+            if not previous:
+                self._append_log(message)
+            if not self.caracal_update_notified:
+                self.tray.showMessage(APP_NAME, message, QSystemTrayIcon.Information, 9000)
+                self.caracal_update_notified = True
+        else:
+            self.caracal_update_notified = False
+            if previous or show_clear_message:
+                self._append_log(summary or "Caracal OS is current.")
+        self.update_tray_alert_state()
+
+    def update_tray_alert_state(self) -> None:
+        alerts: list[str] = []
+        if self.yabridge_pending:
+            alerts.append("Windows VSTs need yabridge sync")
+        if self.caracal_update_pending:
+            alerts.append("Caracal OS update available")
+
+        if alerts:
+            self.tray.setIcon(self.notification_icon)
+            self.tray.setToolTip(f"Caracal Audio Controller - {'; '.join(alerts)}")
+        else:
+            self.tray.setIcon(self.normal_icon)
+            self.tray.setToolTip("Caracal Audio Controller")
 
     def mark_yabridge_synced(self) -> None:
         fingerprint, _item_count = yabridge_fingerprint()
@@ -407,23 +519,20 @@ class AudioController(QObject):
 
 
 def find_terminal() -> str | None:
-    preferred = [os.environ.get("TERMINAL", "").strip()]
-    preferred.extend(
-        [
-            "alacritty",
-            "ghostty",
-            "konsole",
-            "gnome-terminal",
-            "ptyxis",
-            "kgx",
-            "kitty",
-            "wezterm",
-            "xfce4-terminal",
-            "mate-terminal",
-            "x-terminal-emulator",
-            "xterm",
-        ]
-    )
+    preferred = [
+        "ghostty",
+        "konsole",
+        os.environ.get("TERMINAL", "").strip(),
+        "gnome-terminal",
+        "ptyxis",
+        "kgx",
+        "kitty",
+        "wezterm",
+        "xfce4-terminal",
+        "mate-terminal",
+        "x-terminal-emulator",
+        "xterm",
+    ]
     for candidate in preferred:
         if candidate and shutil.which(candidate):
             return candidate
@@ -433,9 +542,9 @@ def find_terminal() -> str | None:
 def terminal_args(terminal: str, script: str) -> list[str]:
     name = Path(terminal).name
     home = str(Path.home())
-    if name == "alacritty":
-        return ["--working-directory", home, "-T", APP_NAME, "-e", "bash", "-lc", script]
-    if name == {"konsole", "ghostty"}:
+    if name == "ghostty":
+        return ["--working-directory", home, "-e", "bash", "-lc", script]
+    if name == "konsole":
         return ["--workdir", home, "-e", "bash", "-lc", script]
     if name in {"gnome-terminal", "ptyxis", "mate-terminal"}:
         return ["--working-directory", home, "--", "bash", "-lc", script]
@@ -450,6 +559,59 @@ def terminal_args(terminal: str, script: str) -> list[str]:
     if name == "xterm":
         return ["-T", APP_NAME, "-e", "bash", "-lc", script]
     return ["-e", "bash", "-lc", script]
+
+
+def caracal_update_check_commands() -> list[list[str]]:
+    commands: list[list[str]] = []
+    if shutil.which("bootc"):
+        commands.append(["bootc", "upgrade", "--check"])
+    if shutil.which("rpm-ostree"):
+        commands.append(["rpm-ostree", "upgrade", "--check"])
+    return commands
+
+
+def parse_caracal_update_check_output(exit_code: int, output: str) -> tuple[bool | None, str]:
+    text = output.strip()
+    lowered = text.casefold()
+
+    if exit_code != 0:
+        return None, first_nonempty_line(text)
+
+    update_markers = (
+        "update available",
+        "availableupdate",
+        "upgraded:",
+        "downgraded:",
+        "removed:",
+        "added:",
+        "total new layers",
+    )
+    no_update_markers = (
+        "no upgrade available",
+        "no update available",
+        "no updates available",
+        "already up to date",
+        "already up-to-date",
+        "system is up to date",
+        "system is up-to-date",
+        "no changes",
+        "no change",
+    )
+
+    if not text or any(marker in lowered for marker in no_update_markers):
+        return False, "Caracal OS is current."
+    if any(marker in lowered for marker in update_markers):
+        return True, "A new Caracal OS version is available. Run Update Caracal OS."
+
+    return False, first_nonempty_line(text) or "Caracal OS is current."
+
+
+def first_nonempty_line(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
 
 
 def load_icon(kind: str = "normal") -> QIcon:
